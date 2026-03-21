@@ -1,8 +1,3 @@
-###############################################################
-# AGI COGNITIVE BENCHMARK SUITE
-# End-to-End Cognitive Benchmark Framework
-###############################################################
-
 ############################################
 # IMPORTS
 ############################################
@@ -29,7 +24,7 @@ NUM_TASKS = 10000
 OOD_TASKS = 2000
 ADAPTIVE_STEPS = 200
 
-MAX_NEW_TOKENS = 150
+MAX_NEW_TOKENS = 1024
 BATCH_SIZE = 8
 
 MODELS = {

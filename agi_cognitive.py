@@ -30,6 +30,7 @@ BATCH_SIZE = 8
 MODELS = {
 
     "gemma": "google/gemma-2b-it",
+    "llama": "meta-llama/Llama-2-7b-chat-hf"
     "mistral": "mistralai/Mistral-7B-Instruct-v0.2"
 
 }

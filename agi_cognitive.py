@@ -1,3 +1,12 @@
+###############################################################
+# AGI COGNITIVE BENCHMARK SUITE
+# End-to-End Cognitive Benchmark Framework
+###############################################################
+
+############################################
+# IMPORTS
+############################################
+
 import random
 import json
 import re
@@ -5,21 +14,31 @@ import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
 
 ############################################
 # CONFIG
 ############################################
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 NUM_TASKS = 10000
+OOD_TASKS = 2000
+ADAPTIVE_STEPS = 200
+
 MAX_NEW_TOKENS = 150
+BATCH_SIZE = 8
 
 MODELS = {
-    "gemma": "google/gemma-1b-it",
-    "llama": "meta-llama/Llama-2-7b-chat-hf",
+
+    "gemma": "google/gemma-2b-it",
     "mistral": "mistralai/Mistral-7B-Instruct-v0.2"
+
 }
+
 
 ############################################
 # MODEL LOADER
@@ -35,39 +54,73 @@ def load_model(model_name):
         torch_dtype=torch.float16 if DEVICE=="cuda" else torch.float32
     )
 
+    model.eval()
+
     return tokenizer, model
 
 
 ############################################
-# YOUR GEMMA FUNCTION
+# BATCHED MODEL CALL
 ############################################
 
-def gemma_model(prompt, tokenizer, model):
+def run_model_batch(prompts, tokenizer, model):
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    inputs = tokenizer(
+        prompts,
+        padding=True,
+        truncation=True,
+        return_tensors="pt"
+    ).to(model.device)
 
-    output = model.generate(
-        **inputs,
-        max_new_tokens=MAX_NEW_TOKENS
-    )
+    with torch.no_grad():
 
-    text = tokenizer.decode(output[0], skip_special_tokens=True)
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS
+        )
 
-    return {
-        "answer": text,
-        "confidence": 0.5
-    }
+    texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+    return texts
 
 
 ############################################
-# GENERIC MODEL CALL
+# ANSWER EXTRACTION
 ############################################
 
-def run_model(prompt, tokenizer, model):
+def extract_answer(text):
 
-    result = gemma_model(prompt, tokenizer, model)
+    nums = re.findall(r'-?\d+', text)
 
-    return result["answer"]
+    if nums:
+        return nums[-1]
+
+    t = text.lower()
+
+    if "yes" in t: return "yes"
+    if "no" in t: return "no"
+
+    words = re.findall(r'[a-z]+', t)
+
+    if words:
+        return words[-1]
+
+    return t.strip()
+
+
+############################################
+# SCORING
+############################################
+
+def judge_answer(pred, gold):
+
+    if pred == gold:
+        return 1
+
+    if gold in pred:
+        return 1
+
+    return 0
 
 
 ############################################
@@ -76,52 +129,33 @@ def run_model(prompt, tokenizer, model):
 
 def arithmetic_task():
 
-    d = random.randint(1,5)
+    d=random.randint(1,5)
 
-    a = random.randint(1,10**d)
-    b = random.randint(1,10**d)
+    a=random.randint(1,10**d)
+    b=random.randint(1,10**d)
 
-    q = f"What is {a}+{b}? Show reasoning then final answer."
+    q=f"What is {a}+{b}?"
 
-    return q, str(a+b), "arithmetic", d
-
-
-def logic_task():
-
-    q = "All birds have wings. Penguins are birds. Do penguins have wings? yes or no."
-
-    return q, "yes", "logic", 2
+    return q,str(a+b),"arithmetic",d
 
 
 def pattern_task():
 
-    start = random.randint(1,10)
-    step = random.randint(2,6)
+    start=random.randint(1,10)
+    step=random.randint(2,6)
 
-    seq = [start+i*step for i in range(4)]
+    seq=[start+i*step for i in range(4)]
 
-    q = f"Find pattern: {seq[0]}, {seq[1]}, {seq[2]}, {seq[3]}, ?"
+    q=f"Find pattern: {seq[0]}, {seq[1]}, {seq[2]}, {seq[3]}, ?"
 
-    return q, str(seq[3]+step), "pattern", 2
+    return q,str(seq[3]+step),"pattern",2
 
 
-def meta_learning_task():
+def logic_task():
 
-    m = random.randint(2,5)
+    q="All birds have wings. Penguins are birds. Do penguins have wings?"
 
-    prompt="Learn rule:\n"
-
-    for i in range(3):
-
-        x=random.randint(1,5)
-
-        prompt+=f"{x}->{x*m}\n"
-
-    t=random.randint(6,10)
-
-    prompt+=f"\nWhat does {t} map to?"
-
-    return prompt,str(t*m),"meta_learning",3
+    return q,"yes","logic",2
 
 
 def planning_task():
@@ -135,55 +169,80 @@ def planning_task():
     return q,str((goal-start)//2),"planning",3
 
 
-def grid_task():
+############################################
+# ARC-STYLE RULE DISCOVERY TASK
+############################################
 
-    grid=[[1,0,1],[0,1,0],[1,0,1]]
+def rule_discovery_task():
 
-    q=f"Grid {grid}. Count ones."
+    rule=random.choice(["linear","multiply","square"])
 
-    return q,"5","grid_reasoning",4
+    if rule=="linear":
+
+        a=random.randint(2,4)
+        b=random.randint(1,5)
+
+        f=lambda x:a*x+b
+
+    elif rule=="multiply":
+
+        m=random.randint(2,5)
+
+        f=lambda x:x*m
+
+    else:
+
+        f=lambda x:x*x
+
+    prompt="Discover rule:\n"
+
+    for _ in range(3):
+
+        x=random.randint(1,5)
+
+        prompt+=f"{x}->{f(x)}\n"
+
+    t=random.randint(6,10)
+
+    prompt+=f"\nWhat does {t} map to?"
+
+    return prompt,str(f(t)),"rule_discovery",4
 
 
-def analogy_task():
+############################################
+# OOD TASKS
+############################################
 
-    q="Dog is to puppy as cat is to ?"
+def ood_arithmetic_task():
 
-    return q,"kitten","analogy",2
+    a=random.randint(1000,5000)
+    b=random.randint(1000,5000)
 
+    q=f"What is {a}+{b}?"
 
-def commonsense_task():
-
-    q="If you drop a glass on the floor what happens?"
-
-    return q,"break","commonsense",1
-
-
-def memory_task():
-
-    q="Remember: apple banana orange. Which fruit was second?"
-
-    return q,"banana","memory",2
+    return q,str(a+b),"ood_arithmetic",5
 
 
-def causal_task():
-
-    q="If rain increases water levels what happens after heavy rain?"
-
-    return q,"flood","causal_reasoning",2
-
+############################################
+# TASK REGISTRY
+############################################
 
 TASKS=[
+
 arithmetic_task,
-logic_task,
 pattern_task,
-meta_learning_task,
+logic_task,
 planning_task,
-grid_task,
-analogy_task,
-commonsense_task,
-memory_task,
-causal_task
+rule_discovery_task
+
 ]
+
+OOD_TASK_SET=[
+
+ood_arithmetic_task
+
+]
+
 
 ############################################
 # TASK GENERATION
@@ -204,58 +263,35 @@ def generate_tasks(n):
         "question":q,
         "answer":a,
         "skill":skill,
-        "difficulty":d
+        "difficulty":d,
+        "distribution":"in_distribution"
+
         })
 
     return tasks
 
 
-############################################
-# ANSWER EXTRACTION
-############################################
+def generate_ood_tasks(n):
 
-def extract_answer(text):
+    tasks=[]
 
-    nums=re.findall(r'\d+',text)
+    for _ in range(n):
 
-    if nums:
-        return nums[-1]
+        fn=random.choice(OOD_TASK_SET)
 
-    t=text.lower()
+        q,a,skill,d=fn()
 
-    if "yes" in t:return "yes"
-    if "no" in t:return "no"
+        tasks.append({
 
-    words=re.findall(r'[a-z]+',t)
+        "question":q,
+        "answer":a,
+        "skill":skill,
+        "difficulty":d,
+        "distribution":"ood"
 
-    if words:
-        return words[-1]
+        })
 
-    return t.strip()
-
-
-############################################
-# SCORING
-############################################
-
-def score(pred,gold):
-
-    return int(pred==gold)
-
-
-############################################
-# LLM AS JUDGE
-############################################
-
-def judge_answer(pred,gold):
-
-    if pred==gold:
-        return 1
-
-    if gold in pred:
-        return 1
-
-    return 0
+    return tasks
 
 
 ############################################
@@ -272,75 +308,145 @@ def run_benchmark(tasks):
 
         tok,model=load_model(mpath)
 
-        for i,t in enumerate(tasks):
+        for i in tqdm(range(0,len(tasks),BATCH_SIZE)):
 
-            raw=run_model(t["question"],tok,model)
+            batch=tasks[i:i+BATCH_SIZE]
 
-            pred=extract_answer(raw)
+            prompts=[t["question"] for t in batch]
 
-            s=judge_answer(pred,t["answer"])
+            outputs=run_model_batch(prompts,tok,model)
 
-            results.append({
+            for t,raw in zip(batch,outputs):
 
-            "model":mname,
-            "skill":t["skill"],
-            "difficulty":t["difficulty"],
-            "prediction":pred,
-            "gold":t["answer"],
-            "score":s
-            })
+                pred=extract_answer(raw)
 
-            if i%200==0:
-                print(mname,"processed",i)
+                s=judge_answer(pred,t["answer"])
+
+                results.append({
+
+                "model":mname,
+                "skill":t["skill"],
+                "difficulty":t["difficulty"],
+                "distribution":t["distribution"],
+                "prediction":pred,
+                "gold":t["answer"],
+                "score":s
+
+                })
 
     return results
+
+
+############################################
+# MODEL COLLAPSE DETECTION
+############################################
+
+def detect_model_collapse(df):
+
+    collapse_scores={}
+
+    for model in df["model"].unique():
+
+        sub=df[df["model"]==model]
+
+        curve=sub.groupby("difficulty")["score"].mean()
+
+        drops=[]
+
+        for i in range(1,len(curve)):
+
+            drop=curve.iloc[i-1]-curve.iloc[i]
+
+            if drop>0.3:
+
+                drops.append(drop)
+
+        collapse_scores[model]=sum(drops)
+
+    return collapse_scores
+
+
+############################################
+# ADAPTIVE BENCHMARK
+############################################
+
+def generate_task_at_difficulty(d):
+
+    if d<=1:
+        fn=logic_task
+
+    elif d==2:
+        fn=pattern_task
+
+    elif d==3:
+        fn=planning_task
+
+    else:
+        fn=rule_discovery_task
+
+    q,a,skill,_=fn()
+
+    return {"question":q,"answer":a,"skill":skill,"difficulty":d}
+
+
+def run_adaptive_benchmark(tokenizer,model):
+
+    difficulty=1
+
+    history=[]
+
+    for step in range(ADAPTIVE_STEPS):
+
+        task=generate_task_at_difficulty(difficulty)
+
+        output=run_model_batch([task["question"]],tokenizer,model)[0]
+
+        pred=extract_answer(output)
+
+        correct=judge_answer(pred,task["answer"])
+
+        history.append({
+
+        "step":step,
+        "difficulty":difficulty,
+        "correct":correct
+
+        })
+
+        if correct:
+            difficulty=min(5,difficulty+1)
+
+        else:
+            difficulty=max(1,difficulty-1)
+
+    return history
 
 
 ############################################
 # ANALYSIS
 ############################################
 
-def analyze(res):
+def analyze(results):
 
-    df=pd.DataFrame(res)
+    df=pd.DataFrame(results)
 
     skill=df.groupby(["model","skill"])["score"].mean()
 
     diff=df.groupby(["model","difficulty"])["score"].mean()
 
+    ood=df[df["distribution"]=="ood"].groupby("model")["score"].mean()
+
     print("\nSkill scores\n",skill)
 
-    print("\nDifficulty curve\n",diff)
+    print("\nDifficulty scaling\n",diff)
+
+    print("\nOOD generalization\n",ood)
+
+    collapse=detect_model_collapse(df)
+
+    print("\nModel collapse metric\n",collapse)
 
     return df
-
-
-############################################
-# PHASE TRANSITION
-############################################
-
-def phase_transition(df):
-
-    curve=df.groupby("difficulty")["score"].mean()
-
-    g=np.gradient(curve.values)
-
-    pt=np.argmax(np.abs(g))
-
-    print("\nReasoning phase transition near difficulty:",pt+1)
-
-
-############################################
-# CALIBRATION
-############################################
-
-def calibration(df):
-
-    conf=0.5
-
-    err=abs(conf-df["score"].mean())
-
-    print("\nCalibration error:",err)
 
 
 ############################################
@@ -357,12 +463,7 @@ def plot(df):
 
     plt.title("Cognitive Skill Accuracy")
 
-    plt.ylabel("accuracy")
-
-    plt.tight_layout()
-
     plt.savefig("skill_accuracy.png")
-
 
     plt.figure()
 
@@ -370,13 +471,30 @@ def plot(df):
 
     diff.plot()
 
-    plt.title("Difficulty Scaling Curve")
-
-    plt.ylabel("accuracy")
-
-    plt.tight_layout()
+    plt.title("Difficulty Scaling")
 
     plt.savefig("difficulty_curve.png")
+
+
+############################################
+# REASONING FRONTIER
+############################################
+
+def plot_frontier(histories):
+
+    plt.figure()
+
+    for model,hist in histories.items():
+
+        diffs=[h["difficulty"] for h in hist]
+
+        plt.plot(diffs,label=model)
+
+    plt.legend()
+
+    plt.title("Reasoning Frontier")
+
+    plt.savefig("reasoning_frontier.png")
 
 
 ############################################
@@ -389,26 +507,43 @@ def main():
 
     tasks=generate_tasks(NUM_TASKS)
 
+    ood=generate_ood_tasks(OOD_TASKS)
+
+    dataset=tasks+ood
+
     with open("tasks.json","w") as f:
-        json.dump(tasks,f,indent=2)
+
+        json.dump(dataset,f,indent=2)
 
     print("Running benchmark")
 
-    results=run_benchmark(tasks)
+    results=run_benchmark(dataset)
 
     with open("results.json","w") as f:
+
         json.dump(results,f,indent=2)
 
     df=analyze(results)
 
-    phase_transition(df)
-
-    calibration(df)
-
     plot(df)
+
+    print("Running adaptive benchmark")
+
+    histories={}
+
+    for mname,mpath in MODELS.items():
+
+        tok,model=load_model(mpath)
+
+        histories[mname]=run_adaptive_benchmark(tok,model)
+
+    plot_frontier(histories)
 
     print("\nBenchmark completed")
 
 
+############################################
+
 if __name__=="__main__":
+
     main()

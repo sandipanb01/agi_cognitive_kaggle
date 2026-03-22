@@ -235,20 +235,138 @@ def beam_search(input_grid, target_grid, dsl_ops, beam_size=10, depth=3):
 
     return best_program
 
-#----------------------------------- ARC_SOLVER/ ARC_SOLVER--------------------------------
 
-from .dsl import DSL
-from .program_search import beam_search
+#-------------------------ARC_SOLVER/OBJECT_DETECTOR--------------------------------------
+
+import numpy as np
+from scipy.ndimage import label
 
 
-def solve_arc(train_pairs):
+def detect_objects(grid):
 
-    input_grid, target_grid = train_pairs[0]
+    objects = []
 
-    program = beam_search(input_grid, target_grid, DSL)
+    colors = np.unique(grid)
 
-    return program
+    for color in colors:
 
+        mask = (grid == color)
+
+        labeled, n = label(mask)
+
+        for i in range(1, n + 1):
+
+            obj_mask = labeled == i
+
+            coords = np.argwhere(obj_mask)
+
+            objects.append({
+                "color": color,
+                "mask": obj_mask,
+                "coords": coords
+            })
+
+    return objects
+
+#------------------------------ARC_SOLVER/ OBJECT_FEATURES_SPATIAL_PROPERTIES------------------------------
+
+import numpy as np
+
+
+def compute_features(obj):
+
+    coords = obj["coords"]
+
+    y = coords[:, 0]
+    x = coords[:, 1]
+
+    return {
+        "color": obj["color"],
+        "area": len(coords),
+        "bbox": (
+            y.min(), y.max(),
+            x.min(), x.max()
+        ),
+        "center": (
+            y.mean(),
+            x.mean()
+        )
+    }
+
+#------------------------ARC_SOLVER/ OBJECT_TRANSFORMATIONS-----------------------------------
+
+import numpy as np
+
+
+def translate_object(grid, obj, dy, dx):
+
+    new_grid = grid.copy()
+
+    new_grid[obj["mask"]] = 0
+
+    coords = obj["coords"]
+
+    for y, x in coords:
+
+        ny = int(y + dy)
+        nx = int(x + dx)
+
+        if 0 <= ny < grid.shape[0] and 0 <= nx < grid.shape[1]:
+
+            new_grid[ny, nx] = obj["color"]
+
+    return new_grid
+
+
+def recolor_object(grid, obj, new_color):
+
+    new_grid = grid.copy()
+
+    new_grid[obj["mask"]] = new_color
+
+    return new_grid
+
+#-------------------------ARC_SOLVER/ OBJECT_LEVEL_REASONER-------------------------------
+
+import numpy as np
+
+from .object_detection import detect_objects
+from .object_features import compute_features
+from .object_transformations import translate_object, recolor_object
+
+
+def reason_objects(input_grid, target_grid):
+
+    objects = detect_objects(input_grid)
+
+    for obj in objects:
+
+        features = compute_features(obj)
+
+        # try translations
+
+        for dy in range(-3, 4):
+            for dx in range(-3, 4):
+
+                pred = translate_object(input_grid, obj, dy, dx)
+
+                if np.array_equal(pred, target_grid):
+
+                    return ("translate", dy, dx)
+
+        # try recoloring
+
+        for color in range(10):
+
+            pred = recolor_object(input_grid, obj, color)
+
+            if np.array_equal(pred, target_grid):
+
+                return ("recolor", color)
+
+    return None
+
+   
 #-----------------------ARC_SOLVER/ NEURAL_GUIDED_SEARCH--------------------------------
 
 def suggest_operations(prompt, model, tokenizer):
@@ -318,6 +436,204 @@ def heuristic_score(pred, target):
     score += overlap / target.size
 
     return score
+
+#----------------------------ARC_SOLVER/ NEURAL_TRANSFORMATION_PREDICTOR--------------------
+
+import torch
+
+
+DSL_KEYWORDS = {
+    "rotate": ["rotate", "rotation"],
+    "flip": ["flip", "mirror"],
+    "translate": ["move", "shift"],
+    "recolor": ["color", "recolor"],
+    "scale": ["expand", "grow"]
+}
+
+
+def predict_operations(prompt, model, tokenizer):
+
+    hint_prompt = f"""
+    Analyze this ARC transformation.
+
+    Predict which operations are likely:
+    rotate, flip, translate, recolor, scale.
+
+    Task:
+    {prompt}
+
+    Answer with operation names.
+    """
+
+    inputs = tokenizer(hint_prompt, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=50
+        )
+
+    text = tokenizer.decode(outputs[0])
+
+    ops = []
+
+    for op, keywords in DSL_KEYWORDS.items():
+
+        for k in keywords:
+
+            if k in text.lower():
+
+                ops.append(op)
+
+    return list(set(ops))
+
+#-------------------------------ARC_SOLVER/ OPERATION_RANKING-------------------------------
+
+def rank_dsl_ops(predicted_ops, dsl):
+
+    ranked = []
+
+    for op in dsl:
+
+        name = op.__name__
+
+        score = 1
+
+        for p in predicted_ops:
+
+            if p in name:
+
+                score += 5
+
+        ranked.append((score, op))
+
+    ranked.sort(reverse=True)
+
+    return [op for _, op in ranked]
+
+#----------------------------ARC_SOLVER/ GUIDED_PROGRAM_SEARCH----------------------
+
+import heapq
+
+from .heuristics import heuristic_score
+
+
+class Program:
+
+    def __init__(self, ops):
+
+        self.ops = ops
+
+    def run(self, grid):
+
+        g = grid
+
+        for op in self.ops:
+
+            g = op(g)
+
+        return g
+
+
+def guided_beam_search(
+        input_grid,
+        target_grid,
+        dsl_ops,
+        beam_size=20,
+        depth=4):
+
+    beam = [(0, Program([]))]
+
+    best_program = None
+    best_score = -1
+
+    for _ in range(depth):
+
+        new_beam = []
+
+        for _, prog in beam:
+
+            for op in dsl_ops:
+
+                candidate = Program(prog.ops + [op])
+
+                try:
+
+                    pred = candidate.run(input_grid)
+
+                    score = heuristic_score(pred, target_grid)
+
+                except:
+
+                    continue
+
+                if score > best_score:
+
+                    best_score = score
+                    best_program = candidate
+
+                heapq.heappush(new_beam, (-score, candidate))
+
+        beam = heapq.nsmallest(beam_size, new_beam)
+
+    return best_program
+
+  
+#-----------------------------ARC_SOLVER/ ARC_SOLVER-------------------------------------
+
+from .program_search import beam_search
+from .dsl import DSL
+from .object_reasoner import reason_objects
+
+
+def solve_arc(train_pairs):
+
+    input_grid, target_grid = train_pairs[0]
+
+    # object reasoning first
+
+    obj_solution = reason_objects(input_grid, target_grid)
+
+    if obj_solution is not None:
+
+        return obj_solution
+
+    # fallback DSL search
+
+    program = beam_search(input_grid, target_grid, DSL)
+
+    return program
+from .dsl import DSL
+from .neural_guidance import predict_operations, rank_dsl_ops
+from .guided_program_search import guided_beam_search
+
+
+def solve_arc(task, model=None, tokenizer=None):
+
+    train = task["train"]
+
+    input_grid, target_grid = train[0]
+
+    prompt = str(input_grid) + " -> " + str(target_grid)
+
+    if model is not None:
+
+        predicted = predict_operations(prompt, model, tokenizer)
+
+        ranked_dsl = rank_dsl_ops(predicted, DSL)
+
+    else:
+
+        ranked_dsl = DSL
+
+    program = guided_beam_search(
+        input_grid,
+        target_grid,
+        ranked_dsl
+    )
+
+    return program    
 
 #----------------------------- THEOREM PROVER/ NEURAL VERIFIER-------------------------------
 

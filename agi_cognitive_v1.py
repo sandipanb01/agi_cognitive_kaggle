@@ -1,7 +1,24 @@
-#----------CONFIG-------------
-import torch
+############################################
+# IMPORTS
+############################################
+
 import random
+import json
+import re
+import torch
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from tqdm import tqdm
+from collections import Counter
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+
+############################################
+# CONFIG
+############################################
 
 SEED = 42
 
@@ -13,25 +30,28 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 NUM_TASKS = 10000
 OOD_TASKS = 2000
-
 ADAPTIVE_STEPS = 200
 
 MAX_NEW_TOKENS = 512
 BATCH_SIZE = 8
 
 SELF_CONSISTENCY_SAMPLES = 3
+TOT_BRANCHES = 3
+REFLEXION_STEPS = 2
+MCTS_SIMULATIONS = 5
 
-OUTPUT_DIR = "benchmark_outputs"
+TEMPERATURE = 0.7
 
 MODELS = {
     "gemma": "google/gemma-2b-it",
     "llama": "meta-llama/Llama-2-7b-chat-hf",
     "mistral": "mistralai/Mistral-7B-Instruct-v0.2"
 }
-#----------MODEL LOADER-------------
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
-from config import DEVICE
+
+
+############################################
+# MODEL LOADER
+############################################
 
 def load_model(model_name):
 
@@ -49,7 +69,12 @@ def load_model(model_name):
     model.eval()
 
     return tokenizer, model
-#----------------------CHAIN-OF-THOUGHT PROMPTING----------------
+
+
+############################################
+# PROMPT BUILDER
+############################################
+
 def build_prompt(question):
 
     return f"""
@@ -62,15 +87,20 @@ Question:
 
 Reasoning:
 """
-#-------------INFERENCE-------------------------
-import torch
-from collections import Counter
-from config import MAX_NEW_TOKENS, SELF_CONSISTENCY_SAMPLES
 
 
-def run_model(prompt, tokenizer, model):
+############################################
+# MODEL CALL
+############################################
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+def run_model_batch(prompts, tokenizer, model):
+
+    inputs = tokenizer(
+        prompts,
+        padding=True,
+        truncation=True,
+        return_tensors="pt"
+    ).to(model.device)
 
     with torch.no_grad():
 
@@ -78,32 +108,39 @@ def run_model(prompt, tokenizer, model):
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
             do_sample=True,
-            temperature=0.7,
-            pad_token_id=tokenizer.eos_token_id
+            temperature=TEMPERATURE,
+            pad_token_id=tokenizer.eos_token_id,
+            output_scores=True,
+            return_dict_in_generate=True
         )
 
-    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    texts = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
 
-    return text
+    return texts, outputs.scores
 
 
-def self_consistency(prompt, tokenizer, model, extractor):
+############################################
+# TOKEN ENTROPY
+############################################
 
-    answers = []
+def token_entropy(scores):
 
-    for _ in range(SELF_CONSISTENCY_SAMPLES):
+    entropies = []
 
-        out = run_model(prompt, tokenizer, model)
+    for step_scores in scores:
 
-        ans = extractor(out)
+        probs = torch.softmax(step_scores, dim=-1)
 
-        answers.append(ans)
+        entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
 
-    return Counter(answers).most_common(1)[0][0]
+        entropies.append(entropy.mean().item())
 
-#-------------SCORING-------------------------------
-import re
+    return float(np.mean(entropies))
 
+
+############################################
+# ANSWER EXTRACTION
+############################################
 
 def extract_answer(text):
 
@@ -114,11 +151,8 @@ def extract_answer(text):
 
     t = text.lower()
 
-    if "yes" in t:
-        return "yes"
-
-    if "no" in t:
-        return "no"
+    if "yes" in t: return "yes"
+    if "no" in t: return "no"
 
     words = re.findall(r'[a-z]+', t)
 
@@ -128,7 +162,11 @@ def extract_answer(text):
     return t.strip()
 
 
-def judge(pred, gold):
+############################################
+# JUDGE
+############################################
+
+def judge_answer(pred, gold):
 
     if pred == gold:
         return 1
@@ -138,9 +176,118 @@ def judge(pred, gold):
 
     return 0
 
-#------------------- TASKS -----------------------
-import random
 
+############################################
+# SELF CONSISTENCY
+############################################
+
+def self_consistency(prompt, tokenizer, model):
+
+    answers = []
+    entropies = []
+
+    for _ in range(SELF_CONSISTENCY_SAMPLES):
+
+        out, scores = run_model_batch([prompt], tokenizer, model)
+
+        ans = extract_answer(out[0])
+
+        answers.append(ans)
+
+        entropies.append(token_entropy(scores))
+
+    counts = Counter(answers)
+
+    best = counts.most_common(1)[0][0]
+
+    return best, answers, float(np.mean(entropies))
+
+
+############################################
+# TREE OF THOUGHT
+############################################
+
+def tree_of_thought(prompt, tokenizer, model):
+
+    candidates = []
+
+    for _ in range(TOT_BRANCHES):
+
+        out, _ = run_model_batch([prompt], tokenizer, model)
+
+        candidates.append(out[0])
+
+    answers = [extract_answer(c) for c in candidates]
+
+    counts = Counter(answers)
+
+    return counts.most_common(1)[0][0]
+
+
+############################################
+# REFLEXION
+############################################
+
+def reflexion(prompt, tokenizer, model):
+
+    reasoning = prompt
+
+    for _ in range(REFLEXION_STEPS):
+
+        out, _ = run_model_batch([reasoning], tokenizer, model)
+
+        text = out[0]
+
+        critique_prompt = f"""
+Analyze the reasoning below and fix any mistakes.
+
+{text}
+
+Correct reasoning:
+"""
+
+        corrected, _ = run_model_batch([critique_prompt], tokenizer, model)
+
+        reasoning = corrected[0]
+
+    return extract_answer(reasoning)
+
+
+############################################
+# MCTS REASONING
+############################################
+
+def mcts_reasoning(prompt, tokenizer, model):
+
+    candidates = []
+
+    for _ in range(MCTS_SIMULATIONS):
+
+        out, _ = run_model_batch([prompt], tokenizer, model)
+
+        candidates.append(out[0])
+
+    answers = [extract_answer(c) for c in candidates]
+
+    return Counter(answers).most_common(1)[0][0]
+
+
+############################################
+# CONFIDENCE ESTIMATION
+############################################
+
+def confidence_score(samples):
+
+    counts = Counter(samples)
+
+    best = counts.most_common(1)[0][1]
+
+    return best / len(samples)
+
+
+############################################
+# TASK GENERATORS
+############################################
 
 def arithmetic_task():
 
@@ -149,193 +296,252 @@ def arithmetic_task():
     a = random.randint(1,10**d)
     b = random.randint(1,10**d)
 
-    return f"What is {a}+{b}?", str(a+b), "arithmetic", d
+    q = f"What is {a}+{b}?"
+
+    return q,str(a+b),"arithmetic",d
+
+
+def pattern_task():
+
+    start=random.randint(1,10)
+    step=random.randint(2,6)
+
+    seq=[start+i*step for i in range(4)]
+
+    q=f"Find pattern: {seq[0]}, {seq[1]}, {seq[2]}, {seq[3]}, ?"
+
+    return q,str(seq[3]+step),"pattern",2
 
 
 def logic_task():
 
-    q = "All birds have wings. Penguins are birds. Do penguins have wings?"
+    q="All birds have wings. Penguins are birds. Do penguins have wings?"
 
-    return q, "yes", "logic", 2
-
-
-def rule_task():
-
-    m = random.randint(2,5)
-
-    f = lambda x: x*m
-
-    prompt = "Discover rule:\n"
-
-    for x in range(1,4):
-        prompt += f"{x}->{f(x)}\n"
-
-    t = random.randint(5,8)
-
-    prompt += f"\nWhat does {t} map to?"
-
-    return prompt, str(f(t)), "rule_discovery", 4
+    return q,"yes","logic",2
 
 
-TASKS = [
-    arithmetic_task,
-    logic_task,
-    rule_task
+def planning_task():
+
+    start=random.randint(1,10)
+
+    goal=start+10
+
+    q=f"You start at {start}. Each move adds 2. How many moves reach {goal}?"
+
+    return q,str((goal-start)//2),"planning",3
+
+
+############################################
+# OOD TASK
+############################################
+
+def ood_arithmetic_task():
+
+    a=random.randint(1000,5000)
+    b=random.randint(1000,5000)
+
+    q=f"What is {a}+{b}?"
+
+    return q,str(a+b),"ood_arithmetic",5
+
+
+############################################
+# TASK REGISTRY
+############################################
+
+TASKS=[
+arithmetic_task,
+pattern_task,
+logic_task,
+planning_task
+]
+
+OOD_TASK_SET=[
+ood_arithmetic_task
 ]
 
 
+############################################
+# TASK GENERATION
+############################################
+
 def generate_tasks(n):
 
-    tasks = []
+    tasks=[]
 
     for _ in range(n):
 
-        fn = random.choice(TASKS)
+        fn=random.choice(TASKS)
 
-        q,a,s,d = fn()
+        q,a,skill,d=fn()
 
         tasks.append({
 
-            "question": q,
-            "answer": a,
-            "skill": s,
-            "difficulty": d,
-            "distribution": "in_distribution"
+        "question":q,
+        "answer":a,
+        "skill":skill,
+        "difficulty":d,
+        "distribution":"in_distribution"
+
         })
 
     return tasks
- #----------------COLLAPSE -----------------------------
-
- def detect_model_collapse(df):
-
-    collapse = {}
-
-    for m in df["model"].unique():
-
-        sub = df[df["model"]==m]
-
-        curve = sub.groupby("difficulty")["score"].mean()
-
-        drops = []
-
-        for i in range(1,len(curve)):
-
-            drop = curve.iloc[i-1] - curve.iloc[i]
-
-            if drop > 0.3:
-                drops.append(drop)
-
-        collapse[m] = sum(drops)
-
-    return collapse
-
-#-----------------REASONING ENTROPY -------------------------
-
-import numpy as np
-from collections import Counter
 
 
-def reasoning_entropy(answers):
+def generate_ood_tasks(n):
 
-    counts = Counter(answers)
+    tasks=[]
 
-    probs = np.array(list(counts.values())) / sum(counts.values())
+    for _ in range(n):
 
-    entropy = -np.sum(probs * np.log(probs))
+        fn=random.choice(OOD_TASK_SET)
 
-    return entropy
+        q,a,skill,d=fn()
 
-#------------------------ ADAPTIVE REASONING --------------------------
+        tasks.append({
 
-import random
+        "question":q,
+        "answer":a,
+        "skill":skill,
+        "difficulty":d,
+        "distribution":"ood"
 
+        })
 
-def generate_task_at_difficulty(d):
-
-    if d <= 2:
-        return "What is 12+7?", "19"
-
-    if d == 3:
-        return "If x+3=10 what is x?", "7"
-
-    return "Sequence: 2,4,8,16, ?", "32"
-
-#-------------------------------- PLOTS------------------------------------
-
-import matplotlib.pyplot as plt
+    return tasks
 
 
-def plot_difficulty(df):
+############################################
+# BENCHMARK
+############################################
 
-    diff = df.groupby(["model","difficulty"])["score"].mean().unstack()
+def run_benchmark(tasks):
 
-    diff.plot()
+    results=[]
 
-    plt.title("Difficulty Scaling")
+    for mname,mpath in MODELS.items():
+
+        print("\nLoading",mname)
+
+        tok,model=load_model(mpath)
+
+        for t in tqdm(tasks):
+
+            prompt=build_prompt(t["question"])
+
+            pred,samples,token_ent=self_consistency(prompt,tok,model)
+
+            tot_pred=tree_of_thought(prompt,tok,model)
+
+            reflex_pred=reflexion(prompt,tok,model)
+
+            mcts_pred=mcts_reasoning(prompt,tok,model)
+
+            conf=confidence_score(samples)
+
+            score=judge_answer(pred,t["answer"])
+
+            results.append({
+
+            "model":mname,
+            "skill":t["skill"],
+            "difficulty":t["difficulty"],
+            "distribution":t["distribution"],
+            "prediction":pred,
+            "tot_prediction":tot_pred,
+            "reflexion_prediction":reflex_pred,
+            "mcts_prediction":mcts_pred,
+            "confidence":conf,
+            "gold":t["answer"],
+            "score":score,
+            "token_entropy":token_ent
+
+            })
+
+    return results
+
+
+############################################
+# ANALYSIS
+############################################
+
+def analyze(results):
+
+    df=pd.DataFrame(results)
+
+    print("\nSkill scores\n",df.groupby(["model","skill"])["score"].mean())
+
+    print("\nDifficulty scaling\n",df.groupby(["model","difficulty"])["score"].mean())
+
+    print("\nOOD generalization\n",df[df["distribution"]=="ood"].groupby("model")["score"].mean())
+
+    print("\nConfidence\n",df.groupby("model")["confidence"].mean())
+
+    return df
+
+
+############################################
+# VISUALIZATION
+############################################
+
+def plot(df):
+
+    skill=df.groupby(["model","skill"])["score"].mean().unstack()
+
+    ax=skill.plot(kind="bar")
+
+    ax.set_title("Cognitive Skill Accuracy")
+
+    plt.savefig("skill_accuracy.png")
+
+    plt.close()
+
+    diff=df.groupby(["model","difficulty"])["score"].mean().unstack()
+
+    ax=diff.plot()
+
+    ax.set_title("Difficulty Scaling")
 
     plt.savefig("difficulty_curve.png")
 
     plt.close()
 
-#--------------------FULL PIPELINE---------------------------
 
-import json
-import pandas as pd
-from tqdm import tqdm
-
-from config import MODELS, NUM_TASKS
-from models import load_model
-from tasks import generate_tasks
-from prompting import build_prompt
-from inference import self_consistency
-from scoring import extract_answer, judge
-from collapse import detect_model_collapse
-from plots import plot_difficulty
-
+############################################
+# MAIN PIPELINE
+############################################
 
 def main():
 
-    tasks = generate_tasks(NUM_TASKS)
+    print("Generating tasks")
 
-    results = []
+    tasks=generate_tasks(NUM_TASKS)
 
-    for name, path in MODELS.items():
+    ood=generate_ood_tasks(OOD_TASKS)
 
-        tok, model = load_model(path)
+    dataset=tasks+ood
 
-        for task in tqdm(tasks):
+    with open("tasks.json","w") as f:
 
-            prompt = build_prompt(task["question"])
+        json.dump(dataset,f,indent=2)
 
-            pred = self_consistency(prompt, tok, model, extract_answer)
+    print("Running benchmark")
 
-            score = judge(pred, task["answer"])
-
-            results.append({
-
-                "model": name,
-                "difficulty": task["difficulty"],
-                "skill": task["skill"],
-                "score": score
-            })
-
-    df = pd.DataFrame(results)
-
-    print(df.groupby(["model","skill"])["score"].mean())
-
-    collapse = detect_model_collapse(df)
-
-    print("Model collapse:", collapse)
-
-    plot_difficulty(df)
+    results=run_benchmark(dataset)
 
     with open("results.json","w") as f:
+
         json.dump(results,f,indent=2)
 
+    df=analyze(results)
 
-if __name__ == "__main__":
+    plot(df)
+
+    print("\nBenchmark completed")
+
+
+############################################
+
+if __name__=="__main__":
+
     main()
-
-
-
-

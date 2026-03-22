@@ -466,5 +466,5 @@ def generate_kaggle_submission(dataset_path, model_key="gemma", output_file="arc
 if __name__=="__main__":
     generate_kaggle_submission(DATASET_PATH, model_key="gemma", output_file="arc_submission_gemma.json")
     # You can also run for LLaMA or Mistral if needed:
-    # generate_kaggle_submission(DATASET_PATH, model_key="llama", output_file="arc_submission_llama.json")
-    # generate_kaggle_submission(DATASET_PATH, model_key="mistral", output_file="arc_submission_mistral.json")
+    generate_kaggle_submission(DATASET_PATH, model_key="llama", output_file="arc_submission_llama.json")
+    generate_kaggle_submission(DATASET_PATH, model_key="mistral", output_file="arc_submission_mistral.json")

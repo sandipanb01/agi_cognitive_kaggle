@@ -1,24 +1,7 @@
-############################################
-# IMPORTS
-############################################
-
-import random
-import json
-import re
+#--------------CONFIG--------------------
 import torch
+import random
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-from tqdm import tqdm
-from collections import Counter
-
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-
-############################################
-# CONFIG
-############################################
 
 SEED = 42
 
@@ -28,119 +11,327 @@ torch.manual_seed(SEED)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-NUM_TASKS = 10000
-OOD_TASKS = 2000
-ADAPTIVE_STEPS = 200
-
-MAX_NEW_TOKENS = 512
-BATCH_SIZE = 8
-
-SELF_CONSISTENCY_SAMPLES = 3
-TOT_BRANCHES = 3
-REFLEXION_STEPS = 2
-MCTS_SIMULATIONS = 5
-
+MAX_NEW_TOKENS = 256
 TEMPERATURE = 0.7
 
-MODELS = {
-    "gemma": "google/gemma-2b-it",
-    "llama": "meta-llama/Llama-2-7b-chat-hf",
-    "mistral": "mistralai/Mistral-7B-Instruct-v0.2"
-}
+SELF_CONSISTENCY_SAMPLES = 5
+TOT_BRANCHES = 4
+REFLEXION_STEPS = 2
+MCTS_SIMULATIONS = 6
+
+#----------------------- MODEL LOADER-------------------------
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 
 
-############################################
-# MODEL LOADER
-############################################
-
-def load_model(model_name):
+def load_llm(model_name):
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        device_map="auto",
-        torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
+        torch_dtype=dtype,
+        device_map="auto"
     )
 
     model.eval()
 
     return tokenizer, model
 
+#------------------------------------ REASONING/SELF-CONSISTENCY------------------
 
-############################################
-# PROMPT BUILDER
-############################################
-
-def build_prompt(question):
-
-    return f"""
-You are a careful reasoning system.
-
-Solve the problem step by step.
-
-Question:
-{question}
-
-Reasoning:
-"""
+from collections import Counter
+from utils.answer_extraction import extract_answer
 
 
-############################################
-# MODEL CALL
-############################################
+def self_consistency(prompt, model, tokenizer, samples):
 
-def run_model_batch(prompts, tokenizer, model):
+    answers = []
 
-    inputs = tokenizer(
-        prompts,
-        padding=True,
-        truncation=True,
-        return_tensors="pt"
-    ).to(model.device)
+    for _ in range(samples):
 
-    with torch.no_grad():
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=True,
-            temperature=TEMPERATURE,
-            pad_token_id=tokenizer.eos_token_id,
-            output_scores=True,
-            return_dict_in_generate=True
-        )
+        output = model.generate(**inputs, max_new_tokens=256)
 
-    texts = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
+        text = tokenizer.decode(output[0], skip_special_tokens=True)
 
-    return texts, outputs.scores
+        ans = extract_answer(text)
+
+        answers.append(ans)
+
+    return Counter(answers).most_common(1)[0][0]
+
+#------------------------------- REASONING/ TREE OF THOUGHT---------------------------
+
+from collections import Counter
+from utils.answer_extraction import extract_answer
 
 
-############################################
-# TOKEN ENTROPY
-############################################
+def tree_of_thought(prompt, model, tokenizer, branches):
 
-def token_entropy(scores):
+    candidates = []
 
-    entropies = []
+    for _ in range(branches):
 
-    for step_scores in scores:
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-        probs = torch.softmax(step_scores, dim=-1)
+        output = model.generate(**inputs, max_new_tokens=256)
 
-        entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
+        text = tokenizer.decode(output[0], skip_special_tokens=True)
 
-        entropies.append(entropy.mean().item())
+        candidates.append(extract_answer(text))
 
-    return float(np.mean(entropies))
+    return Counter(candidates).most_common(1)[0][0]
+
+#-------------------------------- REASONING/ REFLEXION----------------------------------
+
+from utils.answer_extraction import extract_answer
 
 
-############################################
-# ANSWER EXTRACTION
-############################################
+def reflexion(prompt, model, tokenizer, steps):
+
+    reasoning = prompt
+
+    for _ in range(steps):
+
+        inputs = tokenizer(reasoning, return_tensors="pt").to(model.device)
+
+        output = model.generate(**inputs, max_new_tokens=256)
+
+        text = tokenizer.decode(output[0], skip_special_tokens=True)
+
+        critique = f"Critique and fix errors:\n{text}"
+
+        inputs = tokenizer(critique, return_tensors="pt").to(model.device)
+
+        output = model.generate(**inputs, max_new_tokens=256)
+
+        reasoning = tokenizer.decode(output[0], skip_special_tokens=True)
+
+    return extract_answer(reasoning)
+
+#------------------------------- REASONING/ MCTS_REASONING -------------------------
+
+import math
+
+
+class Node:
+
+    def __init__(self, text):
+
+        self.text = text
+        self.visits = 0
+        self.value = 0
+        self.children = []
+
+
+def ucb(parent, child):
+
+    return child.value / (child.visits + 1e-5) + math.sqrt(
+        math.log(parent.visits + 1) / (child.visits + 1)
+    )
+
+#-----------------------------ARC_SOLVER/DSL----------------------------------
+
+import numpy as np
+
+
+def rotate90(grid):
+    return np.rot90(grid)
+
+
+def rotate180(grid):
+    return np.rot90(grid, 2)
+
+
+def flip_horizontal(grid):
+    return np.fliplr(grid)
+
+
+def flip_vertical(grid):
+    return np.flipud(grid)
+
+
+def color_replace(grid, src, tgt):
+
+    g = grid.copy()
+
+    g[g == src] = tgt
+
+    return g
+
+
+DSL = [
+    rotate90,
+    rotate180,
+    flip_horizontal,
+    flip_vertical
+]
+
+#---------------------------------- ARC_SOLVER/ DSL_PROGRAM_SEARCH (BEAM_SEARCH)-----------------------------
+
+import heapq
+from .heuristics import heuristic_score
+
+
+class Program:
+
+    def __init__(self, ops):
+
+        self.ops = ops
+
+    def run(self, grid):
+
+        g = grid
+
+        for op in self.ops:
+
+            g = op(g)
+
+        return g
+
+
+def beam_search(input_grid, target_grid, dsl_ops, beam_size=10, depth=3):
+
+    beam = [(0, Program([]))]
+
+    best_program = None
+    best_score = -1
+
+    for _ in range(depth):
+
+        new_beam = []
+
+        for _, program in beam:
+
+            for op in dsl_ops:
+
+                new_prog = Program(program.ops + [op])
+
+                try:
+
+                    pred = new_prog.run(input_grid)
+
+                    score = heuristic_score(pred, target_grid)
+
+                except:
+                    continue
+
+                if score > best_score:
+
+                    best_score = score
+                    best_program = new_prog
+
+                heapq.heappush(new_beam, (-score, new_prog))
+
+        beam = heapq.nsmallest(beam_size, new_beam)
+
+    return best_program
+
+#----------------------------------- ARC_SOLVER/ ARC_SOLVER--------------------------------
+
+from .dsl import DSL
+from .program_search import beam_search
+
+
+def solve_arc(train_pairs):
+
+    input_grid, target_grid = train_pairs[0]
+
+    program = beam_search(input_grid, target_grid, DSL)
+
+    return program
+
+#-----------------------ARC_SOLVER/ NEURAL_GUIDED_SEARCH--------------------------------
+
+def suggest_operations(prompt, model, tokenizer):
+
+    hint_prompt = f"""
+    Analyze the ARC transformation.
+
+    Suggest operations from:
+    rotate, flip, recolor.
+
+    {prompt}
+    """
+
+    inputs = tokenizer(hint_prompt, return_tensors="pt").to(model.device)
+
+    output = model.generate(**inputs, max_new_tokens=50)
+
+    text = tokenizer.decode(output[0])
+
+    ops = []
+
+    if "rotate" in text:
+        ops.append("rotate")
+
+    if "flip" in text:
+        ops.append("flip")
+
+    return ops
+#-----------------------ARC_SOLVER/ HEURISTICS--------------------------------
+
+import numpy as np
+
+
+def same_shape(a, b):
+
+    return a.shape == b.shape
+
+
+def color_histogram(grid):
+
+    hist = {}
+
+    for v in grid.flatten():
+
+        hist[v] = hist.get(v, 0) + 1
+
+    return hist
+
+
+def histogram_match(a, b):
+
+    return color_histogram(a) == color_histogram(b)
+
+
+def heuristic_score(pred, target):
+
+    score = 0
+
+    if same_shape(pred, target):
+        score += 1
+
+    if histogram_match(pred, target):
+        score += 1
+
+    overlap = np.sum(pred == target)
+
+    score += overlap / target.size
+
+    return score
+
+#----------------------------- THEOREM PROVER/ NEURAL VERIFIER-------------------------------
+
+def verify_solution(solution):
+
+    if solution is None:
+        return False
+
+    return True
+
+#-----------------UTILS/ ANSWER-EXTRACTION----------------------------------
+
+import re
+
 
 def extract_answer(text):
 
@@ -149,399 +340,254 @@ def extract_answer(text):
     if nums:
         return nums[-1]
 
-    t = text.lower()
-
-    if "yes" in t: return "yes"
-    if "no" in t: return "no"
-
-    words = re.findall(r'[a-z]+', t)
+    words = re.findall(r'[a-zA-Z]+', text)
 
     if words:
-        return words[-1]
+        return words[-1].lower()
 
-    return t.strip()
+    return text.strip()
 
+#----------------------------------- TASKS/ SYNTHETIC TASKS --------------------------
 
-############################################
-# JUDGE
-############################################
-
-def judge_answer(pred, gold):
-
-    if pred == gold:
-        return 1
-
-    if gold in pred:
-        return 1
-
-    return 0
+import random
 
 
-############################################
-# SELF CONSISTENCY
-############################################
+def arithmetic():
 
-def self_consistency(prompt, tokenizer, model):
+    a = random.randint(1, 100)
+    b = random.randint(1, 100)
+
+    return f"What is {a} + {b}?", str(a + b)
+
+
+def logic():
+
+    q = "All birds have wings. Penguins are birds. Do penguins have wings?"
+
+    return q, "yes"
+
+#----------------------------------- TRAINING/ SELF-IMPROVEMENT -----------------------
+
+def self_improve(agent, tasks):
+
+    solved = []
+
+    for q, a in tasks:
+
+        pred = agent.solve(q)
+
+        if pred == a:
+            solved.append((q, a))
+
+    agent.train_on(solved)
+
+#----------------ENSENBLE_REASONING---------------------------------
+
+def ensemble_reasoning(prompt, model, tokenizer):
 
     answers = []
-    entropies = []
 
-    for _ in range(SELF_CONSISTENCY_SAMPLES):
+    answers.append(self_consistency(prompt, model, tokenizer, 5))
+    answers.append(tree_of_thought(prompt, model, tokenizer, 4))
+    answers.append(reflexion(prompt, model, tokenizer, 2))
 
-        out, scores = run_model_batch([prompt], tokenizer, model)
+    return max(set(answers), key=answers.count)
 
-        ans = extract_answer(out[0])
+#-------------------ANALYSIS/ ARC_BENCHMARK_RUNNER---------------------------------
 
-        answers.append(ans)
+def evaluate_arc(dataset, solver):
 
-        entropies.append(token_entropy(scores))
+    solved = 0
 
-    counts = Counter(answers)
+    for task in dataset:
 
-    best = counts.most_common(1)[0][0]
+        prog = solver(task["train"])
 
-    return best, answers, float(np.mean(entropies))
+        pred = prog.run(task["test"][0][0])
 
+        if (pred == task["test"][0][1]).all():
 
-############################################
-# TREE OF THOUGHT
-############################################
+            solved += 1
 
-def tree_of_thought(prompt, tokenizer, model):
+    return solved / len(dataset)
 
-    candidates = []
+#-----------------DISTRIBUTED/ MULTI_GPU_RUNNER----------------------------------------------
 
-    for _ in range(TOT_BRANCHES):
+import torch
+import multiprocessing
 
-        out, _ = run_model_batch([prompt], tokenizer, model)
 
-        candidates.append(out[0])
+def run_experiment(config):
 
-    answers = [extract_answer(c) for c in candidates]
+    from main import main
 
-    counts = Counter(answers)
+    main(config)
 
-    return counts.most_common(1)[0][0]
 
+def run_many(configs):
 
-############################################
-# REFLEXION
-############################################
+    with multiprocessing.Pool(len(configs)) as pool:
 
-def reflexion(prompt, tokenizer, model):
+        pool.map(run_experiment, configs)
 
-    reasoning = prompt
+#-------------------------------------- MAIN  FUNCTION 1 --------------------------------------
 
-    for _ in range(REFLEXION_STEPS):
+from models.loader import load_llm
+from reasoning.self_consistency import self_consistency
+from reasoning.tree_of_thought import tree_of_thought
+from reasoning.reflexion import reflexion
 
-        out, _ = run_model_batch([reasoning], tokenizer, model)
+from theorem_prover.neural_verifier import verify_solution
+from tasks.synthetic_tasks import arithmetic, logic
 
-        text = out[0]
+from config import *
 
-        critique_prompt = f"""
-Analyze the reasoning below and fix any mistakes.
 
-{text}
+def solve(prompt, model, tokenizer):
 
-Correct reasoning:
-"""
+    sc = self_consistency(prompt, model, tokenizer, SELF_CONSISTENCY_SAMPLES)
 
-        corrected, _ = run_model_batch([critique_prompt], tokenizer, model)
+    tot = tree_of_thought(prompt, model, tokenizer, TOT_BRANCHES)
 
-        reasoning = corrected[0]
+    ref = reflexion(prompt, model, tokenizer, REFLEXION_STEPS)
 
-    return extract_answer(reasoning)
+    candidates = [sc, tot, ref]
 
+    for c in candidates:
 
-############################################
-# MCTS REASONING
-############################################
+        if verify_solution(c):
 
-def mcts_reasoning(prompt, tokenizer, model):
+            return c
 
-    candidates = []
+    return sc
 
-    for _ in range(MCTS_SIMULATIONS):
-
-        out, _ = run_model_batch([prompt], tokenizer, model)
-
-        candidates.append(out[0])
-
-    answers = [extract_answer(c) for c in candidates]
-
-    return Counter(answers).most_common(1)[0][0]
-
-
-############################################
-# CONFIDENCE ESTIMATION
-############################################
-
-def confidence_score(samples):
-
-    counts = Counter(samples)
-
-    best = counts.most_common(1)[0][1]
-
-    return best / len(samples)
-
-
-############################################
-# TASK GENERATORS
-############################################
-
-def arithmetic_task():
-
-    d = random.randint(1,5)
-
-    a = random.randint(1,10**d)
-    b = random.randint(1,10**d)
-
-    q = f"What is {a}+{b}?"
-
-    return q,str(a+b),"arithmetic",d
-
-
-def pattern_task():
-
-    start=random.randint(1,10)
-    step=random.randint(2,6)
-
-    seq=[start+i*step for i in range(4)]
-
-    q=f"Find pattern: {seq[0]}, {seq[1]}, {seq[2]}, {seq[3]}, ?"
-
-    return q,str(seq[3]+step),"pattern",2
-
-
-def logic_task():
-
-    q="All birds have wings. Penguins are birds. Do penguins have wings?"
-
-    return q,"yes","logic",2
-
-
-def planning_task():
-
-    start=random.randint(1,10)
-
-    goal=start+10
-
-    q=f"You start at {start}. Each move adds 2. How many moves reach {goal}?"
-
-    return q,str((goal-start)//2),"planning",3
-
-
-############################################
-# OOD TASK
-############################################
-
-def ood_arithmetic_task():
-
-    a=random.randint(1000,5000)
-    b=random.randint(1000,5000)
-
-    q=f"What is {a}+{b}?"
-
-    return q,str(a+b),"ood_arithmetic",5
-
-
-############################################
-# TASK REGISTRY
-############################################
-
-TASKS=[
-arithmetic_task,
-pattern_task,
-logic_task,
-planning_task
-]
-
-OOD_TASK_SET=[
-ood_arithmetic_task
-]
-
-
-############################################
-# TASK GENERATION
-############################################
-
-def generate_tasks(n):
-
-    tasks=[]
-
-    for _ in range(n):
-
-        fn=random.choice(TASKS)
-
-        q,a,skill,d=fn()
-
-        tasks.append({
-
-        "question":q,
-        "answer":a,
-        "skill":skill,
-        "difficulty":d,
-        "distribution":"in_distribution"
-
-        })
-
-    return tasks
-
-
-def generate_ood_tasks(n):
-
-    tasks=[]
-
-    for _ in range(n):
-
-        fn=random.choice(OOD_TASK_SET)
-
-        q,a,skill,d=fn()
-
-        tasks.append({
-
-        "question":q,
-        "answer":a,
-        "skill":skill,
-        "difficulty":d,
-        "distribution":"ood"
-
-        })
-
-    return tasks
-
-
-############################################
-# BENCHMARK
-############################################
-
-def run_benchmark(tasks):
-
-    results=[]
-
-    for mname,mpath in MODELS.items():
-
-        print("\nLoading",mname)
-
-        tok,model=load_model(mpath)
-
-        for t in tqdm(tasks):
-
-            prompt=build_prompt(t["question"])
-
-            pred,samples,token_ent=self_consistency(prompt,tok,model)
-
-            tot_pred=tree_of_thought(prompt,tok,model)
-
-            reflex_pred=reflexion(prompt,tok,model)
-
-            mcts_pred=mcts_reasoning(prompt,tok,model)
-
-            conf=confidence_score(samples)
-
-            score=judge_answer(pred,t["answer"])
-
-            results.append({
-
-            "model":mname,
-            "skill":t["skill"],
-            "difficulty":t["difficulty"],
-            "distribution":t["distribution"],
-            "prediction":pred,
-            "tot_prediction":tot_pred,
-            "reflexion_prediction":reflex_pred,
-            "mcts_prediction":mcts_pred,
-            "confidence":conf,
-            "gold":t["answer"],
-            "score":score,
-            "token_entropy":token_ent
-
-            })
-
-    return results
-
-
-############################################
-# ANALYSIS
-############################################
-
-def analyze(results):
-
-    df=pd.DataFrame(results)
-
-    print("\nSkill scores\n",df.groupby(["model","skill"])["score"].mean())
-
-    print("\nDifficulty scaling\n",df.groupby(["model","difficulty"])["score"].mean())
-
-    print("\nOOD generalization\n",df[df["distribution"]=="ood"].groupby("model")["score"].mean())
-
-    print("\nConfidence\n",df.groupby("model")["confidence"].mean())
-
-    return df
-
-
-############################################
-# VISUALIZATION
-############################################
-
-def plot(df):
-
-    skill=df.groupby(["model","skill"])["score"].mean().unstack()
-
-    ax=skill.plot(kind="bar")
-
-    ax.set_title("Cognitive Skill Accuracy")
-
-    plt.savefig("skill_accuracy.png")
-
-    plt.close()
-
-    diff=df.groupby(["model","difficulty"])["score"].mean().unstack()
-
-    ax=diff.plot()
-
-    ax.set_title("Difficulty Scaling")
-
-    plt.savefig("difficulty_curve.png")
-
-    plt.close()
-
-
-############################################
-# MAIN PIPELINE
-############################################
 
 def main():
 
-    print("Generating tasks")
+    tokenizer, model = load_llm("google/gemma-2b-it")
 
-    tasks=generate_tasks(NUM_TASKS)
+    tasks = [arithmetic() for _ in range(20)]
 
-    ood=generate_ood_tasks(OOD_TASKS)
+    for q, a in tasks:
 
-    dataset=tasks+ood
+        pred = solve(q, model, tokenizer)
 
-    with open("tasks.json","w") as f:
+        print()
 
-        json.dump(dataset,f,indent=2)
+        print("QUESTION:", q)
 
-    print("Running benchmark")
+        print("PRED:", pred)
 
-    results=run_benchmark(dataset)
-
-    with open("results.json","w") as f:
-
-        json.dump(results,f,indent=2)
-
-    df=analyze(results)
-
-    plot(df)
-
-    print("\nBenchmark completed")
+        print("GOLD:", a)
 
 
-############################################
-
-if __name__=="__main__":
+if __name__ == "__main__":
 
     main()
+
+#--------------------------------- MAIN_FUNCTION_2--------------------------------------
+
+import numpy as np
+
+from config import *
+
+from models.loader import load_llm
+from models.perception_encoder import PerceptionEncoder
+from models.jepa_world_model import JEPAWorldModel
+from models.muzero_planner import MuZeroPlanner
+
+from reasoning.self_consistency import self_consistency
+from reasoning.tree_of_thought import tree_of_thought
+from reasoning.reflexion import reflexion
+from reasoning.ensemble import ensemble_reasoning
+
+from arc_solver.arc_solver import solve_arc
+
+from theorem_prover.neural_verifier import verify_solution
+
+from tasks.synthetic_tasks import generate_tasks
+
+
+class AGIAgent:
+
+    def __init__(self):
+
+        self.tokenizer, self.llm = load_llm("google/gemma-2b-it")
+
+        self.perception = PerceptionEncoder()
+
+        self.world_model = JEPAWorldModel()
+
+        self.planner = MuZeroPlanner()
+
+    def reason_llm(self, prompt):
+
+        sc = self_consistency(prompt, self.llm, self.tokenizer, 5)
+
+        tot = tree_of_thought(prompt, self.llm, self.tokenizer, 4)
+
+        ref = reflexion(prompt, self.llm, self.tokenizer, 2)
+
+        return ensemble_reasoning([sc, tot, ref])
+
+    def solve_symbolic(self, task):
+
+        program = solve_arc(task["train"])
+
+        if program is None:
+
+            return None
+
+        pred = program.run(task["test"][0][0])
+
+        return pred
+
+    def solve(self, task):
+
+        if task["type"] == "arc":
+
+            pred = self.solve_symbolic(task)
+
+            if verify_solution(pred):
+
+                return pred
+
+        prompt = task["question"]
+
+        return self.reason_llm(prompt)
+
+
+def main():
+
+    print("Initializing AGI agent")
+
+    agent = AGIAgent()
+
+    tasks = generate_tasks(20)
+
+    solved = 0
+
+    for t in tasks:
+
+        pred = agent.solve(t)
+
+        print("\nTASK:", t)
+
+        print("PRED:", pred)
+
+        print("GOLD:", t["answer"])
+
+        if str(pred) == str(t["answer"]):
+
+            solved += 1
+
+    print("\nAccuracy:", solved / len(tasks))
+
+
+if __name__ == "__main__":
+
+    main()
+
+
+
+

@@ -1,16 +1,18 @@
 ############################################################
-# FULLY INTEGRATED ARC + LLM + JEPA + MuZero + COGNITIVE REASONING PIPELINE
+# MONOLITHIC FULLY INTEGRATED ARC SOLVER + LLM + JEPA + MuZero + DSL + COGNITIVE REASONING
 # Author: SANDIPAN BHATTACHERJEE
-# Purpose: Kaggle Measuring AGI / ARC Solver / SOTA Mega Pipeline
 ############################################################
 
-import os, random, json, pickle, hashlib, itertools, re
+import os, random, json, pickle, hashlib, itertools, re, math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.ndimage import label
 from collections import Counter
+from tqdm import tqdm
+import heapq
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 ############################################################
@@ -20,32 +22,29 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 SEED = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Pipeline parameters
 MAX_NEW_TOKENS = 128
 BEAM_SIZE = 120
 SEARCH_DEPTH = 9
 MUTATION_RATE = 0.3
-SELF_CONSISTENCY_SAMPLES = 3
-TOT_BRANCHES = 3
+SELF_CONSISTENCY_SAMPLES = 5
+TOT_BRANCHES = 4
 REFLEXION_STEPS = 2
-MCTS_SIMULATIONS = 5
+MCTS_SIMULATIONS = 6
+MAX_PROGRAMS = 200
 TEMPERATURE = 0.7
 
-# LLM models
 MODEL_REGISTRY = {
     "gemma": "google/gemma-2b-it",
     "llama": "meta-llama/Llama-2-7b-chat-hf",
     "mistral": "mistralai/Mistral-7B-Instruct-v0.1"
 }
 
-# Cache folders
 CACHE_DIR = "cache"
 LLM_CACHE = os.path.join(CACHE_DIR, "llm_predictions")
 PROGRAM_CACHE = os.path.join(CACHE_DIR, "programs")
 os.makedirs(LLM_CACHE, exist_ok=True)
 os.makedirs(PROGRAM_CACHE, exist_ok=True)
 
-# Set seeds
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -65,11 +64,11 @@ def canonicalize(grid):
     grid = np.array(grid)
     bg = np.bincount(grid.flatten()).argmax()
     grid = grid - bg
-    grid[grid<0]=0
+    grid[grid<0] = 0
     return grid
 
 def color_histogram(grid):
-    hist={}
+    hist = {}
     for v in grid.flatten(): hist[v] = hist.get(v,0)+1
     return hist
 
@@ -83,17 +82,17 @@ def heuristic_score(pred,target):
     return score
 
 ############################################################
-# OBJECT REASONER
+# OBJECT-CENTRIC PERCEPTION
 ############################################################
 
 def detect_objects(grid):
-    grid=np.array(grid)
+    grid = np.array(grid)
     objects=[]
     for c in np.unique(grid):
-        mask=grid==c
-        labeled,n=label(mask)
+        mask = grid==c
+        labeled,n = label(mask)
         for i in range(1,n+1):
-            m=labeled==i
+            m = labeled==i
             coords=np.argwhere(m)
             objects.append({"color":c,"mask":m,"coords":coords})
     return objects
@@ -183,7 +182,8 @@ def load_llm(model_key="gemma"):
 
 def predict_operations(prompt,model,tokenizer):
     inputs=tokenizer(prompt,return_tensors="pt").to(model.device)
-    with torch.no_grad(): outputs=model.generate(**inputs,max_new_tokens=60,temperature=TEMPERATURE)
+    with torch.no_grad(): 
+        outputs=model.generate(**inputs,max_new_tokens=60,temperature=TEMPERATURE)
     text=tokenizer.decode(outputs[0]).lower()
     ops=[]
     for op,keywords in DSL_KEYWORDS.items():
@@ -202,7 +202,7 @@ def rank_dsl(predicted_ops,dsl_list=None):
     return [o for _,o in ranked]
 
 ############################################################
-# PROGRAM CLASS AND SEARCH
+# PROGRAM SEARCH
 ############################################################
 
 class Program:
@@ -248,42 +248,39 @@ def search_program(train_pairs,ranked_dsl,beam_size=BEAM_SIZE,search_depth=SEARC
     return best
 
 ############################################################
-# ARC SOLVER WITH SELF-CONSISTENCY / TOT / REFLEXION / MCTS
+# COGNITIVE REASONING LOOPS
 ############################################################
+
+class SearchNode:
+    def __init__(self,text): self.text=text; self.visits=0; self.value=0; self.children=[]
 
 def run_model(prompt,tokenizer,model):
     inputs=tokenizer(prompt,return_tensors="pt").to(model.device)
     with torch.no_grad():
         outputs=model.generate(**inputs,max_new_tokens=MAX_NEW_TOKENS,temperature=TEMPERATURE)
-    text=tokenizer.decode(outputs[0],skip_special_tokens=True)
-    return text
+    return tokenizer.decode(outputs[0],skip_special_tokens=True)
 
 def self_consistency(prompt,tokenizer,model):
     answers=[]
     for _ in range(SELF_CONSISTENCY_SAMPLES):
         out=run_model(prompt,tokenizer,model)
-        ans=extract_answer(out)
-        answers.append(ans)
-    return Counter(answers).most_common(1)[0][0],answers
+        answers.append(extract_answer(out))
+    return Counter(answers).most_common(1)[0][0]
 
 def tree_of_thought(prompt,tokenizer,model):
     candidates=[]
     for _ in range(TOT_BRANCHES):
         out=run_model(prompt,tokenizer,model)
-        candidates.append(out)
-    answers=[extract_answer(c) for c in candidates]
-    return Counter(answers).most_common(1)[0][0]
+        candidates.append(extract_answer(out))
+    return Counter(candidates).most_common(1)[0][0]
 
 def reflexion(prompt,tokenizer,model):
     reasoning=prompt
     for _ in range(REFLEXION_STEPS):
         out=run_model(reasoning,tokenizer,model)
-        critique=f"Fix errors:\n{out}"
+        critique=f"Critique and fix errors:\n{out}"
         reasoning=run_model(critique,tokenizer,model)
     return extract_answer(reasoning)
-
-class SearchNode:
-    def __init__(self,text): self.text=text; self.visits=0; self.value=0; self.children=[]
 
 def mcts_reasoning(prompt,tokenizer,model):
     root=SearchNode(prompt)
@@ -293,13 +290,60 @@ def mcts_reasoning(prompt,tokenizer,model):
     answers=[extract_answer(c.text) for c in root.children]
     return Counter(answers).most_common(1)[0][0]
 
-def solve_arc(task, model=None, tokenizer=None, beam_size=BEAM_SIZE, search_depth=SEARCH_DEPTH, dsl_list=None):
+############################################################
+# JEPA WORLD MODEL
+############################################################
+
+class JEPA(nn.Module):
+    def __init__(self,input_size=16,latent_dim=128):
+        super().__init__()
+        self.encoder=nn.Sequential(nn.Flatten(),nn.Linear(input_size*input_size,input_size*latent_dim),nn.ReLU(),nn.Linear(input_size*latent_dim,latent_dim))
+        self.predictor=nn.Sequential(nn.Linear(latent_dim,latent_dim),nn.ReLU(),nn.Linear(latent_dim,latent_dim))
+        self.decoder=nn.Sequential(nn.Linear(latent_dim,latent_dim),nn.ReLU(),nn.Linear(latent_dim,input_size*input_size))
+        self.input_size=input_size
+    def forward(self,x):
+        z=self.encoder(x.float())
+        z_pred=self.predictor(z)
+        out=self.decoder(z_pred).reshape(-1,self.input_size,self.input_size)
+        return out
+
+############################################################
+# MuZero PLANNER
+############################################################
+
+class MuZeroNode:
+    def __init__(self,state,prior=1.0):
+        self.state=state
+        self.prior=prior
+        self.value=0
+        self.visits=0
+        self.children={}
+
+def muzero_plan(init_state,jepa_model,sim_steps=5):
+    root=MuZeroNode(init_state)
+    for _ in range(sim_steps):
+        node=root
+        path=[]
+        while node.children:
+            action,max_prior=max(node.children.items(),key=lambda x:x[1].prior)
+            node=node.children[action]
+            path.append(node)
+        z=torch.tensor(node.state).unsqueeze(0).to(DEVICE)
+        pred=jepa_model(z).detach().cpu().numpy()[0]
+        node.children[0]=MuZeroNode(pred,prior=random.random())
+    best_child=max(root.children.items(),key=lambda x:x[1].value)[1]
+    return best_child.state
+
+############################################################
+# ARC SOLVER WRAPPER
+############################################################
+
+def solve_arc_task(task, model=None, tokenizer=None, beam_size=BEAM_SIZE, search_depth=SEARCH_DEPTH, dsl_list=None):
     train_pairs=[(canonicalize(np.array(x["input"])),canonicalize(np.array(x["output"]))) for x in task["train"]]
     prompt=str(train_pairs)
-    prompt_hash=hashlib.md5(prompt.encode()).hexdigest()
-
+    task_id=hashlib.md5(str(task["train"]).encode()).hexdigest()
     if model and tokenizer:
-        cache_file=os.path.join(LLM_CACHE,f"{prompt_hash}.pkl")
+        cache_file=os.path.join(LLM_CACHE,f"{hashlib.md5(prompt.encode()).hexdigest()}.pkl")
         if os.path.exists(cache_file):
             with open(cache_file,"rb") as f: predicted_ops=pickle.load(f)
         else:
@@ -307,164 +351,37 @@ def solve_arc(task, model=None, tokenizer=None, beam_size=BEAM_SIZE, search_dept
             with open(cache_file,"wb") as f: pickle.dump(predicted_ops,f)
         ranked_dsl=rank_dsl(predicted_ops,dsl_list)
     else: ranked_dsl=DSL if dsl_list is None else dsl_list
-
-    task_id=hashlib.md5(str(task["train"]).encode()).hexdigest()
-    program=search_program(train_pairs,ranked_dsl,beam_size,search_depth,task_id=task_id)
+    program=search_program(train_pairs,ranked_dsl,beam_size,search_depth,task_id)
     test_grid=canonicalize(np.array(task["test"][0]["input"]))
-    # Apply cognitive reasoning loops
-    sc_ans,_=self_consistency(str(test_grid),tokenizer,model)
-    tot_ans=tree_of_thought(str(test_grid),tokenizer,model)
-    reflex_ans=reflexion(str(test_grid),tokenizer,model)
-    mcts_ans=mcts_reasoning(str(test_grid),tokenizer,model)
-    return program.run(test_grid)
+    # JEPA + MuZero planning
+    jepa_model=JEPA(input_size=test_grid.shape[0]).to(DEVICE)
+    planned_grid=muzero_plan(test_grid,jepa_model)
+    # LLM reasoning over planned grid
+    sc_ans=self_consistency(str(planned_grid),tokenizer,model)
+    tot_ans=tree_of_thought(str(planned_grid),tokenizer,model)
+    ref_ans=reflexion(str(planned_grid),tokenizer,model)
+    mcts_ans=mcts_reasoning(str(planned_grid),tokenizer,model)
+    final_grid=program.run(planned_grid)
+    return final_grid
 
 ############################################################
-# DATASET LOADER & EVALUATION
+# KAGGLE SUBMISSION GENERATOR
 ############################################################
 
-def load_arc_dataset(path):
-    tasks=[]
-    for f in os.listdir(path):
-        if f.endswith(".json"):
-            with open(os.path.join(path,f)) as j: tasks.append(json.load(j))
-    return tasks
-
-def evaluate(tasks,solver):
-    solved=0
-    for t in tasks:
-        try:
-            pred=solver(t)
-            gold=np.array(t["test"][0]["output"])
-            if np.array_equal(pred,gold): solved+=1
-        except: pass
-    return solved/len(tasks)
-
-############################################################
-# COGNITIVE WORLD MODEL (JEPA) + MuZero PLANNER
-############################################################
-
-class JEPAWorldModel(nn.Module):
-    def __init__(self,dim=512):
-        super().__init__()
-        self.encoder=nn.Sequential(nn.Linear(dim,dim),nn.ReLU(),nn.Linear(dim,dim))
-        self.predictor=nn.Sequential(nn.Linear(dim,dim),nn.ReLU(),nn.Linear(dim,dim))
-    def forward(self,context,target):
-        z_context=self.encoder(context)
-        z_target=self.encoder(target)
-        pred=self.predictor(z_context)
-        loss=F.mse_loss(pred,z_target)
-        return loss
-
-class MuZeroPlanner:
-    def __init__(self,world_model,simulations=5):
-        self.world_model=world_model
-        self.simulations=simulations
-    def plan(self,state_latent):
-        best_action=None
-        best_value=-float("inf")
-        for _ in range(self.simulations):
-            action=torch.randn_like(state_latent)
-            value=-torch.norm(action-state_latent)
-            if value>best_value: best_value=value; best_action=action
-        return best_action
-
-############################################################
-# MAIN EXPERIMENT
-############################################################
-
-def run_experiment(dataset_path, model_key="gemma"):
-    tokenizer, model=load_llm(model_key)
-    tasks=load_arc_dataset(dataset_path)
-    world_model=JEPAWorldModel(dim=64).to(DEVICE)
-    planner=MuZeroPlanner(world_model,simulations=MCTS_SIMULATIONS)
-
-    def solver(task):
-        test_input=canonicalize(np.array(task["test"][0]["input"]))
-        latent=torch.tensor(test_input.flatten(),dtype=torch.float32).to(DEVICE)
-        action=planner.plan(latent)
-        return solve_arc(task,model,tokenizer)
-
-    score=evaluate(tasks,solver)
-    print(f"ARC score with {model_key}: {score:.3f}")
-    return score
-
-############################################################
-# PARAMETER SWEEP
-############################################################
-
-def run_parameter_sweep(dataset_path):
-    tasks=load_arc_dataset(dataset_path)
-    OUTPUT_CSV="arc_parameter_sweep_results.csv"
-    LLM_MODELS=["gemma","llama","mistral"]
-    BEAM_SIZES=[50,100,150]
-    SEARCH_DEPTHS=[6,9,12]
-    DSL_SETS=["default","expanded"]
-
-    import csv
-    with open(OUTPUT_CSV,"w",newline="") as csvfile:
-        writer=csv.DictWriter(csvfile,fieldnames=["llm_model","beam_size","search_depth","dsl_set","accuracy"])
-        writer.writeheader()
-
-        for llm_model,beam,depth,dsl_set_name in itertools.product(LLM_MODELS,BEAM_SIZES,SEARCH_DEPTHS,DSL_SETS):
-            print(f"\nRunning: LLM={llm_model}, beam={beam}, depth={depth}, DSL={dsl_set_name}")
-            tokenizer, model=load_llm(llm_model)
-            dsl_list=DSL[:4] if dsl_set_name=="default" else DSL
-
-            def solver(task):
-                return solve_arc(task,model,tokenizer,beam_size=beam,search_depth=depth,dsl_list=dsl_list)
-
-            accuracy=evaluate(tasks,solver)
-            print(f"Accuracy: {accuracy:.3f}")
-            writer.writerow({"llm_model":llm_model,"beam_size":beam,"search_depth":depth,"dsl_set":dsl_set_name,"accuracy":accuracy})
+def generate_kaggle_submission(tasks_json_path,model_key="gemma",output_path="submission.json"):
+    tokenizer,model=load_llm(model_key)
+    with open(tasks_json_path,"r") as f: tasks=json.load(f)
+    submission=[]
+    for task in tqdm(tasks):
+        pred=solve_arc_task(task,model,tokenizer)
+        submission.append({"task_id":task["task_id"],"output":pred.tolist()})
+    with open(output_path,"w") as f: json.dump(submission,f)
+    print(f"Kaggle submission saved to {output_path}")
 
 ############################################################
 # MAIN
 ############################################################
 
 if __name__=="__main__":
-    DATASET_PATH="/kaggle/input/arc-prize-2024/"
-    print("Running full mega ARC pipeline with JEPA + MuZero + Cognitive Reasoning...")
-
-    for model_key in ["gemma","llama","mistral"]:
-        run_experiment(DATASET_PATH, model_key)
-
-    run_parameter_sweep(DATASET_PATH)
-
-############################################################
-# KAGGLE SUBMISSION GENERATOR
-############################################################
-
-def generate_kaggle_submission(dataset_path, model_key="gemma", output_file="arc_submission.json"):
-    tokenizer, model = load_llm(model_key)
-    tasks = load_arc_dataset(dataset_path)
-    submission = []
-
-    for task in tasks:
-        task_id = task.get("task_id", hashlib.md5(str(task).encode()).hexdigest())
-        try:
-            # Solve each test task using your full ARC + LLM + JEPA + MuZero pipeline
-            pred_grid = solve_arc(task, model, tokenizer)
-            pred_list = pred_grid.tolist()  # Convert numpy array to nested lists for JSON
-            submission.append({
-                "task_id": task_id,
-                "output": pred_list
-            })
-            print(f"Task {task_id} solved.")
-        except Exception as e:
-            print(f"Task {task_id} failed: {e}")
-            submission.append({
-                "task_id": task_id,
-                "output": []
-            })
-
-    # Save submission JSON
-    with open(output_file, "w") as f:
-        json.dump(submission, f, indent=2)
-    print(f"Kaggle submission saved as {output_file}")
-
-# Example usage: generate submission for Gemma
-if __name__=="__main__":
-    generate_kaggle_submission(DATASET_PATH, model_key="gemma", output_file="arc_submission_gemma.json")
-    # You can also run for LLaMA or Mistral if needed:
-    generate_kaggle_submission(DATASET_PATH, model_key="llama", output_file="arc_submission_llama.json")
-    generate_kaggle_submission(DATASET_PATH, model_key="mistral", output_file="arc_submission_mistral.json")
+    # Generate Kaggle submission
+    generate_kaggle_submission("tasks.json",model_key="llama",output_path="submission.json")
